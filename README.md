@@ -1,0 +1,2 @@
+# SubTech
+A subscription tracker
