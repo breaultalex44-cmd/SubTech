@@ -1822,14 +1822,27 @@
       }
 
       init() {
-        // Load settings from LocalStorage
-        const savedSubs = localStorage.getItem('subtech_data');
-        const savedReminders = localStorage.getItem('subtech_reminders');
-        const savedCurrency = localStorage.getItem('subtech_currency');
-        const savedPin = localStorage.getItem('subtech_pin');
+        // Load settings from LocalStorage safely
+        let savedSubs = null;
+        let savedReminders = null;
+        let savedCurrency = null;
+        let savedPin = null;
+
+        try {
+          savedSubs = localStorage.getItem('subtech_data');
+          savedReminders = localStorage.getItem('subtech_reminders');
+          savedCurrency = localStorage.getItem('subtech_currency');
+          savedPin = localStorage.getItem('subtech_pin');
+        } catch (err) {
+          console.warn('LocalStorage read error:', err);
+        }
 
         if (savedReminders !== null) {
-          this.globalReminders = JSON.parse(savedReminders);
+          try {
+            this.globalReminders = JSON.parse(savedReminders);
+          } catch(e) {
+            this.globalReminders = true;
+          }
         }
         document.getElementById('globalReminderToggle').checked = this.globalReminders;
 
@@ -1844,7 +1857,16 @@
         }
 
         if (savedSubs) {
-          this.subscriptions = JSON.parse(savedSubs);
+          try {
+            const parsed = JSON.parse(savedSubs);
+            if (Array.isArray(parsed)) {
+              this.subscriptions = parsed;
+            } else {
+              this.loadSampleData();
+            }
+          } catch(e) {
+            this.loadSampleData();
+          }
         } else {
           this.loadSampleData();
         }
@@ -1852,7 +1874,9 @@
         // Global Reminder Toggle Event
         document.getElementById('globalReminderToggle').addEventListener('change', (e) => {
           this.globalReminders = e.target.checked;
-          localStorage.setItem('subtech_reminders', JSON.stringify(this.globalReminders));
+          try {
+            localStorage.setItem('subtech_reminders', JSON.stringify(this.globalReminders));
+          } catch(err) {}
           this.showToast(this.globalReminders ? 'Daily Reminders Enabled' : 'Daily Reminders Disabled');
           this.checkDailyReminders();
         });
@@ -1932,14 +1956,20 @@
       }
 
       saveData() {
-        localStorage.setItem('subtech_data', JSON.stringify(this.subscriptions));
+        try {
+          localStorage.setItem('subtech_data', JSON.stringify(this.subscriptions));
+        } catch(e) {
+          console.error('Failed to save data to localStorage:', e);
+        }
       }
 
       /* MULTI-CURRENCY LOGIC */
       setCurrency(curr) {
         if (!CURRENCIES[curr]) return;
         this.currentCurrency = curr;
-        localStorage.setItem('subtech_currency', curr);
+        try {
+          localStorage.setItem('subtech_currency', curr);
+        } catch(e) {}
         this.updateCurrencySymbols();
         this.render();
         this.showToast(`Currency changed to ${curr}`);
@@ -1951,8 +1981,9 @@
       }
 
       formatCurrency(val) {
-        const c = CURRENCIES[this.currentCurrency];
-        const converted = val * c.rate;
+        const safeVal = Number(val) || 0;
+        const c = CURRENCIES[this.currentCurrency] || CURRENCIES.USD;
+        const converted = safeVal * c.rate;
         return `${c.symbol}${converted.toFixed(2)}`;
       }
 
@@ -1964,14 +1995,26 @@
         this.render();
       }
 
-      calculateNextRenewal(purchaseDateStr, durationDays) {
-        const start = new Date(purchaseDateStr);
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+      // Explicit UTC date construction to prevent local timezone offsets from distorting days/renewals
+      parseLocalDate(dateStr) {
+        if (!dateStr) return new Date();
+        const parts = dateStr.split('-');
+        if (parts.length === 3) {
+          return new Date(Date.UTC(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2])));
+        }
+        return new Date(dateStr);
+      }
 
-        let nextRenewal = new Date(start);
-        while (nextRenewal <= today) {
-          nextRenewal.setDate(nextRenewal.getDate() + parseInt(durationDays));
+      calculateNextRenewal(purchaseDateStr, durationDays) {
+        const cycleDays = Math.max(1, parseInt(durationDays) || 30);
+        const start = this.parseLocalDate(purchaseDateStr);
+        
+        const now = new Date();
+        const todayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+
+        let nextRenewal = new Date(start.getTime());
+        while (nextRenewal <= todayUTC) {
+          nextRenewal.setUTCDate(nextRenewal.getUTCDate() + cycleDays);
         }
 
         return nextRenewal;
@@ -1979,20 +2022,21 @@
 
       getDaysRemaining(purchaseDateStr, durationDays) {
         const nextRenewal = this.calculateNextRenewal(purchaseDateStr, durationDays);
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+        const now = new Date();
+        const todayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 
-        const diffTime = nextRenewal - today;
-        return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        const diffTime = nextRenewal.getTime() - todayUTC.getTime();
+        return Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
       }
 
       render() {
         const grid = document.getElementById('subscriptionsGrid');
-        const searchVal = document.getElementById('searchInput').value.toLowerCase();
+        const searchInput = document.getElementById('searchInput');
+        const searchVal = searchInput ? searchInput.value.toLowerCase() : '';
 
         // Active vs Paused vs Filter logic
         let filtered = this.subscriptions.filter(sub => {
-          const matchesSearch = sub.name.toLowerCase().includes(searchVal);
+          const matchesSearch = (sub.name || '').toLowerCase().includes(searchVal);
           
           let matchesCategory = (this.categoryFilter === 'all') || (sub.category === this.categoryFilter);
 
@@ -2016,25 +2060,29 @@
         const multiplier = this.spendPeriod === 'yearly' ? 12 : 1;
 
         const currentSpendNormalized = activeSubs.reduce((sum, s) => {
-          const monthlyFactor = 30 / s.durationDays;
-          const userShare = parseFloat(s.initialPrice) / (s.splitCount || 1);
+          const cycleDays = Math.max(1, parseInt(s.durationDays) || 30);
+          const monthlyFactor = 30 / cycleDays;
+          const userShare = (parseFloat(s.initialPrice) || 0) / (parseInt(s.splitCount) || 1);
           return sum + (userShare * monthlyFactor);
         }, 0) * multiplier;
 
         const projectedSpendNormalized = activeSubs.reduce((sum, s) => {
-          const price = (s.projectedPrice !== null && s.projectedPrice !== undefined && s.projectedPrice !== '') 
+          const rawPrice = (s.projectedPrice !== null && s.projectedPrice !== undefined && s.projectedPrice !== '') 
             ? parseFloat(s.projectedPrice) 
             : parseFloat(s.initialPrice);
-          const monthlyFactor = 30 / s.durationDays;
-          const userShare = price / (s.splitCount || 1);
+          const price = Number.isNaN(rawPrice) ? 0 : rawPrice;
+          const cycleDays = Math.max(1, parseInt(s.durationDays) || 30);
+          const monthlyFactor = 30 / cycleDays;
+          const userShare = price / (parseInt(s.splitCount) || 1);
           return sum + (userShare * monthlyFactor);
         }, 0) * multiplier;
 
         // Calculate Total Saved over time from paused/archived subscriptions
         const totalSavedAnnualized = pausedSubs.reduce((sum, s) => {
           const price = parseFloat(s.initialPrice) || parseFloat(s.projectedPrice) || 0;
-          const monthlyFactor = 30 / s.durationDays;
-          const userShare = price / (s.splitCount || 1);
+          const cycleDays = Math.max(1, parseInt(s.durationDays) || 30);
+          const monthlyFactor = 30 / cycleDays;
+          const userShare = price / (parseInt(s.splitCount) || 1);
           return sum + (userShare * monthlyFactor * 12);
         }, 0);
 
@@ -2094,12 +2142,15 @@
           const card = document.createElement('div');
           card.className = `sub-card ${sub.isPaused ? 'paused' : ''}`;
 
-          const rawPrice = (sub.projectedPrice !== undefined && sub.projectedPrice !== '') 
+          const rawPriceVal = (sub.projectedPrice !== undefined && sub.projectedPrice !== '') 
             ? parseFloat(sub.projectedPrice) 
             : parseFloat(sub.initialPrice);
+          const rawPrice = Number.isNaN(rawPriceVal) ? 0 : rawPriceVal;
+          const initialPriceVal = parseFloat(sub.initialPrice) || 0;
 
-          const userNetPrice = rawPrice / (sub.splitCount || 1);
-          const initialNetPrice = parseFloat(sub.initialPrice) / (sub.splitCount || 1);
+          const split = parseInt(sub.splitCount) || 1;
+          const userNetPrice = rawPrice / split;
+          const initialNetPrice = initialPriceVal / split;
 
           // Payment method icon mapping
           let payIcon = 'fa-credit-card';
@@ -2111,7 +2162,7 @@
               <div class="sub-card-header">
                 <div class="sub-info">
                   <div class="service-logo" style="background: ${sub.color || 'var(--gradient-primary)'}">
-                    ${sub.name.charAt(0).toUpperCase()}
+                    ${(sub.name || 'S').charAt(0).toUpperCase()}
                   </div>
                   <div>
                     <div class="service-title">
@@ -2141,7 +2192,7 @@
                 </div>
               </div>
 
-              ${sub.splitCount > 1 ? `<div class="split-pill"><i class="fa-solid fa-user-group"></i> Split x${sub.splitCount} (${this.formatCurrency(rawPrice)} Total)</div>` : ''}
+              ${split > 1 ? `<div class="split-pill"><i class="fa-solid fa-user-group"></i> Split x${split} (${this.formatCurrency(rawPrice)} Total)</div>` : ''}
               ${sub.isFreeTrial ? '<span class="trial-badge"><i class="fa-solid fa-gift"></i> Free Trial</span>' : ''}
             </div>
 
@@ -2157,10 +2208,10 @@
                 </button>
 
                 <button class="btn-hold-delete" 
-                        onmousedown="app.startHoldDelete('${sub.id}', this)" 
+                        onmousedown="app.startHoldDelete('${sub.id}', this, event)" 
                         onmouseup="app.cancelHoldDelete('${sub.id}', this)" 
                         onmouseleave="app.cancelHoldDelete('${sub.id}', this)"
-                        ontouchstart="app.startHoldDelete('${sub.id}', this)"
+                        ontouchstart="app.startHoldDelete('${sub.id}', this, event)"
                         ontouchend="app.cancelHoldDelete('${sub.id}', this)"
                         ontouchcancel="app.cancelHoldDelete('${sub.id}', this)">
                   <div class="hold-progress"></div>
@@ -2184,8 +2235,11 @@
 
         activeSubs.forEach(s => {
           const cat = s.category || 'Other';
-          const monthlyFactor = 30 / s.durationDays;
-          const userShare = parseFloat(s.initialPrice) / (s.splitCount || 1);
+          const cycleDays = Math.max(1, parseInt(s.durationDays) || 30);
+          const monthlyFactor = 30 / cycleDays;
+          const price = parseFloat(s.initialPrice) || 0;
+          const split = parseInt(s.splitCount) || 1;
+          const userShare = price / split;
           const spend = userShare * monthlyFactor;
 
           catTotals[cat] = (catTotals[cat] || 0) + spend;
@@ -2234,7 +2288,14 @@
         }
       }
 
-      startHoldDelete(id, btn) {
+      startHoldDelete(id, btn, e) {
+        if (e && e.type === 'touchstart') {
+          // Prevent ghost mouse event triggers on mobile
+          if (e.cancelable) e.preventDefault();
+        }
+
+        this.cancelHoldDelete(id, btn);
+
         const progressBar = btn.querySelector('.hold-progress');
         if (progressBar) {
           progressBar.style.transition = 'width 2s linear';
@@ -2251,10 +2312,12 @@
           clearTimeout(this.holdTimers[id]);
           delete this.holdTimers[id];
         }
-        const progressBar = btn.querySelector('.hold-progress');
-        if (progressBar) {
-          progressBar.style.transition = 'width 0.1s linear';
-          progressBar.style.width = '0%';
+        if (btn) {
+          const progressBar = btn.querySelector('.hold-progress');
+          if (progressBar) {
+            progressBar.style.transition = 'width 0.1s linear';
+            progressBar.style.width = '0%';
+          }
         }
       }
 
@@ -2267,11 +2330,21 @@
       }
 
       openModal(modalId) {
+        if (modalId === 'subscriptionModal') {
+          document.getElementById('subForm').reset();
+          document.getElementById('purchaseDate').value = new Date().toISOString().split('T')[0];
+          document.getElementById('splitCount').value = 1;
+          this.activeColor = null;
+        }
         document.getElementById(modalId).classList.add('active');
       }
 
       closeModal(modalId) {
         document.getElementById(modalId).classList.remove('active');
+        if (modalId === 'subscriptionModal') {
+          document.getElementById('subForm').reset();
+          this.activeColor = null;
+        }
       }
 
       handleOverlayClick(e, modalId) {
@@ -2309,11 +2382,11 @@
       handleFormSubmit(e) {
         e.preventDefault();
 
-        const name = document.getElementById('serviceName').value;
-        const initialPrice = parseFloat(document.getElementById('initialPrice').value);
-        const projectedPrice = document.getElementById('projectedPrice').value;
-        const purchaseDate = document.getElementById('purchaseDate').value;
-        const durationDays = parseInt(document.getElementById('durationDays').value);
+        const name = document.getElementById('serviceName').value.trim();
+        const initialPrice = parseFloat(document.getElementById('initialPrice').value) || 0;
+        const projectedPriceInput = document.getElementById('projectedPrice').value;
+        const purchaseDate = document.getElementById('purchaseDate').value || new Date().toISOString().split('T')[0];
+        const durationDays = parseInt(document.getElementById('durationDays').value) || 30;
         const isFreeTrial = document.getElementById('isFreeTrial').checked;
         const category = document.getElementById('serviceCategory').value;
         const paymentSource = document.getElementById('paymentSource').value;
@@ -2323,7 +2396,7 @@
           id: 'sub_' + Date.now(),
           name,
           initialPrice,
-          projectedPrice: projectedPrice !== '' ? parseFloat(projectedPrice) : initialPrice,
+          projectedPrice: projectedPriceInput !== '' ? parseFloat(projectedPriceInput) : initialPrice,
           purchaseDate,
           durationDays,
           isFreeTrial,
@@ -2342,11 +2415,6 @@
         this.checkDailyReminders();
         this.closeModal('subscriptionModal');
         this.showToast(`Added ${name}`);
-
-        document.getElementById('subForm').reset();
-        document.getElementById('purchaseDate').value = new Date().toISOString().split('T')[0];
-        document.getElementById('splitCount').value = 1;
-        this.activeColor = null;
       }
 
       /* FEATURE 6: JSON EXPORT & IMPORT */
